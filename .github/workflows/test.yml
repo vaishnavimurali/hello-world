@@ -1,0 +1,120 @@
+
+name: Promote Applications Between Environments
+run-name: "Promote ${{ inputs.applications }} from ${{ inputs.source-environment }} to ${{ inputs.target-environment }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      applications:
+        description: 'Comma-separated application names (e.g., canvas-backend,tools-api)'
+        required: true
+        type: string
+
+      source-environment:
+        description: 'Environment to read the currently deployed application versions from'
+        required: true
+        type: environment
+
+      target-environment:
+        description: 'Environment to deploy those versions to'
+        required: true
+        type: environment
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  S3_ARTIFACT_BUCKET: 312826-riai-deployment-artifacts
+
+jobs:
+  resolve-source-versions:
+    name: Resolve Source Versions
+    runs-on: ubuntu-latest
+    outputs:
+      deployments: ${{ steps.resolve.outputs.deployments }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials (Master account for S3)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_MASTER_ACCOUNT_ID }}:role/github-actions-s3-read
+          aws-region: ${{ vars.AWS_MASTER_REGION }}
+
+      - name: Resolve selected applications from source environment
+        id: resolve
+        env:
+          APPLICATIONS: ${{ inputs.applications }}
+          SOURCE_ENVIRONMENT: ${{ inputs.source-environment }}
+          TARGET_ENVIRONMENT: ${{ inputs.target-environment }}
+          ARTIFACT_BUCKET: ${{ env.S3_ARTIFACT_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          if [ "$SOURCE_ENVIRONMENT" = "$TARGET_ENVIRONMENT" ]; then
+            echo "::error::Source and target environments must be different."
+            exit 1
+          fi
+
+          IFS=',' read -r -a REQUESTED_APPS <<< "$APPLICATIONS"
+          if [ "${#REQUESTED_APPS[@]}" -eq 0 ]; then
+            echo "::error::Select at least one application."
+            exit 1
+          fi
+
+          DEPLOYMENTS='[]'
+          for RAW_APPLICATION in "${REQUESTED_APPS[@]}"; do
+            APPLICATION=$(printf '%s' "$RAW_APPLICATION" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+            if [[ ! "$APPLICATION" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+              echo "::error::Invalid application name: '${APPLICATION}'"
+              exit 1
+            fi
+
+            CONFIG_PATH="deployments/applications/${APPLICATION}/config.yaml"
+            if [ ! -f "$CONFIG_PATH" ]; then
+              echo "::error::Application config not found: ${CONFIG_PATH}"
+              exit 1
+            fi
+
+            if jq -e --arg application "$APPLICATION" 'any(.[]; .application == $application)' <<< "$DEPLOYMENTS" > /dev/null; then
+              echo "::error::Application '${APPLICATION}' was selected more than once."
+              exit 1
+            fi
+
+            STATE_PATH="s3://${ARTIFACT_BUCKET}/state/${SOURCE_ENVIRONMENT}/${APPLICATION}/current.json"
+            if ! aws s3 cp "$STATE_PATH" current-state.json; then
+              echo "::error::No current deployment found for '${APPLICATION}' in '${SOURCE_ENVIRONMENT}'."
+              exit 1
+            fi
+
+            VERSION=$(jq -er '.deployment.version | select(type == "string" and length > 0)' current-state.json) || {
+              echo "::error::Could not read the deployed version for '${APPLICATION}' from ${STATE_PATH}"
+              exit 1
+            }
+
+            ENTRY=$(jq -cn --arg application "$APPLICATION" --arg version "$VERSION" \
+              '{application: $application, version: $version}')
+            DEPLOYMENTS=$(jq -cn --argjson current "$DEPLOYMENTS" --argjson entry "$ENTRY" \
+              '$current + [$entry]')
+            echo "Resolved ${APPLICATION}: ${VERSION}"
+          done
+
+          echo "deployments=${DEPLOYMENTS}" >> "$GITHUB_OUTPUT"
+
+  deploy-to-target:
+    name: Deploy ${{ matrix.application }} ${{ matrix.version }} to ${{ inputs.target-environment }}
+    needs: resolve-source-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-source-versions.outputs.deployments) }}
+    uses: ./.github/workflows/deploy-application.yml
+    with:
+      application: ${{ matrix.application }}
+      version: ${{ matrix.version }}
+      environment: ${{ inputs.target-environment }}
+      dry-run: false
+    secrets: inherit
